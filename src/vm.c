@@ -1693,6 +1693,17 @@ task_across_c_boundary(mrb_state *mrb)
    stack-local c_jmp on entry; leaving it dangling after this early return
    means a later raise longjmps into a freed frame (issue #6863).
 
+   A pending switch is never honored while the scheduler is locked, i.e.
+   during mrb_execute_proc_synchronously(). That function holds the lock and
+   drives mrb_vm_exec() in a bare loop of its own, so there is no scheduler
+   frame to catch an early return: the VM would come back having executed
+   nothing, the loop would call it again, and since nothing clears
+   task.switching the pair would spin forever. The lock already means "no
+   asynchronous task operation may run here", and mrb_tick sets the flag from
+   the timer interrupt without consulting it -- a sleeper waking mid-run is
+   enough to trip this. Deferring rather than clearing keeps the switch
+   pending, so it is honored on the first OP boundary after the lock drops.
+
    A pending switch is never honored on the root context. The root context
    is not a task: it has no scheduler frame to catch the early return, so
    bailing out of its mrb_vm_exec leaves the call-info stack drifted and trips
@@ -1706,6 +1717,7 @@ task_across_c_boundary(mrb_state *mrb)
    inside mrb_vm_exec (via NEXT / END_DISPATCH). */
 #define RETURN_IF_TASK_STOPPED(mrb) do { \
   if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
+       !(mrb)->task.scheduler_lock && \
        !(mrb)->exc && \
        !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
       (mrb)->c->status == MRB_TASK_STOPPED) { \
