@@ -783,9 +783,15 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
   mrb_callinfo *ci;
   for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
     if (ci->cci > 0) {
-      /* Inside C function - fall back to blocking sleep without context switch */
+      /* Inside C function - fall back to blocking sleep without context switch.
+         A switch already requested by the tick stays pending. This frame
+         cannot honor it, but the VM can once the C frame pops, and that is
+         where it belongs. Clearing it here drops it: the timeslice arm fires
+         on the edge where the counter reaches 0, and the counter is only
+         reset in execute_task(), which a task that keeps running never
+         reaches. A later wakeup re-raises the flag, so what is lost is the
+         preemption until some other task happens to wake. */
       mrb_hal_task_sleep_us(mrb, usec);
-      switching_ = FALSE;
       return;
     }
   }

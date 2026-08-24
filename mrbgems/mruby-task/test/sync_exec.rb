@@ -22,3 +22,25 @@ if Object.const_defined?(:TaskTest) && TaskTest.respond_to?(:run_sync)
     assert_equal 42, result
   end
 end
+
+# The same loop entered while a switch is already pending, from inside the C
+# frame that deferred it. Needs the burn helpers, so it is guarded separately.
+if Object.const_defined?(:TaskTest) && TaskTest.respond_to?(:run_sync) &&
+   TaskTest.respond_to?(:block_ms) && TaskTest.respond_to?(:timeslice_ms) &&
+   TaskTest.respond_to?(:switch_pending?)
+  assert('mruby-task: synchronous execution completes with a switch pending') do
+    result = nil
+    pending = nil
+    Task.new(name: "sync") do
+      Array.new(1) do
+        TaskTest.block_ms(TaskTest.timeslice_ms * 3)
+        pending = TaskTest.switch_pending?
+        result = TaskTest.run_sync { 40 + 2 }
+      end
+    end
+    Task.run
+
+    assert_true pending, "no switch was pending, so the driver loop was not exercised"
+    assert_equal 42, result
+  end
+end

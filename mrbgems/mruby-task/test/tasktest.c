@@ -7,23 +7,70 @@
 #include <mruby/error.h>
 #include "task.h"
 
-/* Burn CPU until `ms` milliseconds of CPU time have elapsed, then raise.
-   Blocking longer than MRB_TICK_UNIT * MRB_TIMESLICE_TICK_COUNT guarantees
-   the tick handler has expired the running task's timeslice, so
-   mrb->task.switching is pending when mrb_raise unwinds into the VM's
-   catch-handler dispatch — the window where a pending switch used to
-   swallow a handled exception into the task result. */
+/* Burn CPU until `ms` milliseconds have elapsed. Blocking longer than
+   MRB_TICK_UNIT * MRB_TIMESLICE_TICK_COUNT guarantees the tick handler has
+   expired the running task's timeslice, so a switch is pending by the time
+   this returns. */
+static void
+tasktest_burn(mrb_int ms)
+{
+  clock_t end = clock() + (clock_t)(((double)ms / 1000.0) * (double)CLOCKS_PER_SEC);
+  while (clock() < end) {
+    /* busy-wait. ticks keep firing */
+  }
+}
+
+/* Burn, then raise from C. That puts the pending switch in front of
+   mrb_raise unwinding into the VM's catch-handler dispatch, the window where
+   a pending switch used to swallow a handled exception into the task
+   result. */
 static mrb_value
 tasktest_block_then_raise(mrb_state *mrb, mrb_value self)
 {
   mrb_int ms;
   mrb_get_args(mrb, "i", &ms);
-  clock_t end = clock() + (clock_t)(((double)ms / 1000.0) * (double)CLOCKS_PER_SEC);
-  while (clock() < end) {
-    /* busy-wait; ticks keep firing */
-  }
+  tasktest_burn(ms);
   mrb_raise(mrb, E_RUNTIME_ERROR, "raised after blocking");
   return mrb_nil_value(); /* not reached */
+}
+
+/* Burn and return, for the cases that need the timeslice to expire inside a
+   C frame without an exception unwinding out of it. */
+static mrb_value
+tasktest_block_ms(mrb_state *mrb, mrb_value self)
+{
+  mrb_int ms;
+  mrb_get_args(mrb, "i", &ms);
+  tasktest_burn(ms);
+  return mrb_nil_value();
+}
+
+/* The build's own timeslice, so a test can outlast it by construction rather
+   than by a literal that a raised MRB_TICK_UNIT would silently invalidate. */
+static mrb_value
+tasktest_timeslice_ms(mrb_state *mrb, mrb_value self)
+{
+  return mrb_fixnum_value((mrb_int)(MRB_TICK_UNIT * MRB_TIMESLICE_TICK_COUNT));
+}
+
+/* Whether a switch is actually pending. Without one the C-boundary fallback
+   has nothing to drop, so a test that means to exercise it proves nothing. */
+static mrb_value
+tasktest_switch_pending_p(mrb_state *mrb, mrb_value self)
+{
+  return mrb_bool_value(mrb->task.switching);
+}
+
+/* Whether a switch requested right now would be deferred by a C frame, which
+   is the other half of that precondition. */
+static mrb_value
+tasktest_switch_deferred_p(mrb_state *mrb, mrb_value self)
+{
+  mrb_callinfo *ci;
+  for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
+    if (ci->cci > 0) return mrb_true_value();
+  }
+  return mrb_false_value();
 }
 
 /* Scheduler-hook probes. Two counters so the replace semantics can be
@@ -272,6 +319,10 @@ mrb_mruby_task_gem_test(mrb_state* mrb)
 {
   struct RClass *tasktest = mrb_define_module(mrb, "TaskTest");
   mrb_define_module_function(mrb, tasktest, "block_then_raise", tasktest_block_then_raise, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, tasktest, "block_ms", tasktest_block_ms, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, tasktest, "timeslice_ms", tasktest_timeslice_ms, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "switch_deferred?", tasktest_switch_deferred_p, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "switch_pending?", tasktest_switch_pending_p, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, tasktest, "install_probe_hook", tasktest_install_probe_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "probe_count", tasktest_probe_count, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_wake_hook", tasktest_install_wake_hook, MRB_ARGS_REQ(1));
