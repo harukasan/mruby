@@ -1628,15 +1628,15 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 #define INIT_DISPATCH for (;;) { CALL_CODE_HOOKS(); switch (insn) {
 #define CASE(insn,ops) case insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
 #define NEXT goto L_END_DISPATCH
-#define JUMP NEXT
-#define END_DISPATCH L_END_DISPATCH: RETURN_IF_TASK_STOPPED(mrb);}}
+#define JUMP goto L_JUMP_DISPATCH
+#define END_DISPATCH L_JUMP_DISPATCH: RETURN_IF_TASK_STOPPED(mrb); L_END_DISPATCH: ;}}
 
 #else
 
 #define INIT_DISPATCH JUMP; return mrb_nil_value();
 #define CASE(insn,ops) L_ ## insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
-#define NEXT RETURN_IF_TASK_STOPPED(mrb); CALL_CODE_HOOKS(); goto *optable[insn]
-#define JUMP NEXT
+#define NEXT CALL_CODE_HOOKS(); goto *optable[insn]
+#define JUMP RETURN_IF_TASK_STOPPED(mrb); NEXT
 #define END_DISPATCH RETURN_IF_TASK_STOPPED(mrb)
 
 #endif
@@ -1668,7 +1668,7 @@ task_across_c_boundary(mrb_state *mrb)
    true. The walk runs callbacks (which may call back into mrb_vm_exec via
    mrb_yield); returning early from an inner exec while the outer C
    iteration is still active drifts the call-info stack and eventually
-   crashes (issue #6862). Switches resume at the next OP boundary after
+   crashes (issue #6862). Switches resume at the next control transfer after
    the walk releases gc.iterating. A pending switch is also deferred while
    executing across a C call boundary (see task_across_c_boundary). A
    pending MRB_TASK_STOPPED is not deferred, since the task is going away.
@@ -1686,7 +1686,7 @@ task_across_c_boundary(mrb_state *mrb)
    task.switching is always pending at raise time). The same window
    covers break/ensure unwinding, which carries RBreak in mrb->exc
    across NEXT. Deferral is bounded: the handler's first instruction
-   consumes mrb->exc, so the switch happens one instruction later.
+   consumes mrb->exc, so the switch happens at the transfer that follows.
 
    mrb->jmp is restored to prev_jmp before returning, exactly as the
    normal return paths below do. mrb_vm_exec set mrb->jmp to its own
@@ -1699,8 +1699,8 @@ task_across_c_boundary(mrb_state *mrb)
    the assertion in mrb_vm_run. This happens when Task.pass is driven from the
    root context (the UI-loop-on-root pattern) while a stray switch flag is
    left set by background-task activity (issue #6887). switching is set from
-   the timer interrupt (mrb_tick), so a genuine task always clears it on the
-   next OP boundary; only the root context can observe it spuriously.
+   the timer interrupt (mrb_tick), so a genuine task always clears it at its
+   next control transfer. Only the root context can observe it spuriously.
 
    A pending switch is never honored while the scheduler is locked, which is
    what mrb_execute_proc_synchronously() does. It drives mrb_vm_exec in a bare
