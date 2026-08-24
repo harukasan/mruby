@@ -1693,17 +1693,6 @@ task_across_c_boundary(mrb_state *mrb)
    stack-local c_jmp on entry; leaving it dangling after this early return
    means a later raise longjmps into a freed frame (issue #6863).
 
-   A pending switch is never honored while the scheduler is locked, i.e.
-   during mrb_execute_proc_synchronously(). That function holds the lock and
-   drives mrb_vm_exec() in a bare loop of its own, so there is no scheduler
-   frame to catch an early return: the VM would come back having executed
-   nothing, the loop would call it again, and since nothing clears
-   task.switching the pair would spin forever. The lock already means "no
-   asynchronous task operation may run here", and mrb_tick sets the flag from
-   the timer interrupt without consulting it -- a sleeper waking mid-run is
-   enough to trip this. Deferring rather than clearing keeps the switch
-   pending, so it is honored on the first OP boundary after the lock drops.
-
    A pending switch is never honored on the root context. The root context
    is not a task: it has no scheduler frame to catch the early return, so
    bailing out of its mrb_vm_exec leaves the call-info stack drifted and trips
@@ -1713,14 +1702,57 @@ task_across_c_boundary(mrb_state *mrb)
    the timer interrupt (mrb_tick), so a genuine task always clears it on the
    next OP boundary; only the root context can observe it spuriously.
 
-   This macro must only be expanded where prev_jmp is in scope, i.e.
+   A pending switch is never honored while the scheduler is locked, which is
+   what mrb_execute_proc_synchronously() does. It drives mrb_vm_exec in a bare
+   loop of its own, so nothing there catches an early return: the VM would
+   come back having executed nothing, with ci->pc unchanged and the flag still
+   raised, and the loop would call it again forever. Its temporary context
+   also starts empty, so the C boundary that deferred the switch for the
+   caller does not defer it here. The lock already means no asynchronous task
+   operation may run, and mrb_tick raises the flag without consulting it.
+
+   All of this lives out of line, in task_must_yield() below.
+
+   NEXT expands at every opcode in the computed-goto build, and mrb_vm_exec
+   carries MRB_FLATTEN, so an inline predicate is duplicated at each of those
+   sites along with task_across_c_boundary(). Behind a single volatile load
+   of the switching flag, a dispatch pays that load and one branch that is
+   not taken.
+
+   Testing MRB_TASK_STOPPED there rather than on every dispatch means a
+   context that stops while it is the running one has to raise the flag as
+   well. mrb_stop_task() is the site that gains that, and
+   terminate_task_internal() already did it.
+
+   noinline only for the computed-goto build. The switch build expands the
+   check once, so a call there would cost what it saves elsewhere. */
+#if !defined(MRB_USE_VM_SWITCH_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
+# define MRB_TASK_NOINLINE __attribute__((noinline))
+#else
+# define MRB_TASK_NOINLINE
+#endif
+
+static mrb_bool MRB_TASK_NOINLINE
+task_must_yield(mrb_state *mrb)
+{
+  /* A stopped context is never deferred, not even under the scheduler lock:
+     the task is going away, and mrb_execute_proc_synchronously() ends its
+     driver loop on exactly this status, so a stop taken while it holds the
+     lock still has to reach the VM. Every other condition below defers. */
+  if (mrb->c->status == MRB_TASK_STOPPED) return TRUE;
+  return mrb->c != mrb->root_c &&
+         !mrb->task.scheduler_lock &&
+         !mrb->exc &&
+         !mrb->gc.iterating &&
+         !task_across_c_boundary(mrb);
+}
+
+#undef MRB_TASK_NOINLINE
+
+/* This macro must only be expanded where prev_jmp is in scope, i.e.
    inside mrb_vm_exec (via NEXT / END_DISPATCH). */
 #define RETURN_IF_TASK_STOPPED(mrb) do { \
-  if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
-       !(mrb)->task.scheduler_lock && \
-       !(mrb)->exc && \
-       !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
-      (mrb)->c->status == MRB_TASK_STOPPED) { \
+  if (mrb_unlikely((mrb)->task.switching) && task_must_yield(mrb)) { \
     (mrb)->jmp = prev_jmp; \
     return mrb_nil_value(); \
   } \

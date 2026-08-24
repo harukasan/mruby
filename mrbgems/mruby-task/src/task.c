@@ -454,6 +454,12 @@ execute_task(mrb_state *mrb, mrb_task *t)
     return;
   }
 
+  /* Every caller runs task_cleanup_if_stopped() immediately before this, and
+     the VM now only notices a stop through the switching flag, so a stopped
+     task reaching here would run rather than retire. Assert what the callers
+     are relied on to guarantee. */
+  mrb_assert(t->c.status != MRB_TASK_STOPPED);
+
   /* Set task as running */
   t->timeslice = MRB_TIMESLICE_TICK_COUNT;
   t->status = MRB_TASK_STATUS_RUNNING;
@@ -774,7 +780,11 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
   if (mrb->c == mrb->root_c) {
     /* Not in task context - sleep in real wall-clock time using HAL */
     mrb_hal_task_sleep_us(mrb, usec);
-    /* Clear switching flag - we're in root context, not switching to a task */
+    /* Clear switching flag - we're in root context, not switching to a task.
+       Unlike the C-frame fallback below, nothing later makes this switch
+       deliverable: the root context is not a task, so it has no scheduler
+       frame to return into. Keeping the flag raised here would only leave
+       every root dispatch calling the check for the rest of the run. */
     switching_ = FALSE;
     return;
   }
@@ -1713,6 +1723,14 @@ mrb_stop_task(mrb_state *mrb, mrb_value task)
     return FALSE;  /* Already stopped */
   }
   t->c.status = MRB_TASK_STOPPED;
+  /* The VM reaches its stop check only once switching_ is raised, so a task
+     stopped while it is the running context has to raise it here. Raising it
+     for a task that is not running would preempt whatever is running now for
+     no reason: a stopped task sitting at the head of the ready queue is
+     retired by task_cleanup_if_stopped() when the scheduler next reaches it. */
+  if (mrb->c == &t->c) {
+    switching_ = TRUE;
+  }
   return TRUE;
 }
 
