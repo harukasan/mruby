@@ -2449,15 +2449,15 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 #define INIT_DISPATCH for (;;) { CALL_CODE_HOOKS(); switch (insn) {
 #define CASE(insn,ops) case insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
 #define NEXT goto L_END_DISPATCH
-#define JUMP NEXT
-#define END_DISPATCH L_END_DISPATCH: RETURN_IF_TASK_STOPPED(mrb);}}
+#define JUMP goto L_JUMP_DISPATCH
+#define END_DISPATCH L_JUMP_DISPATCH: RETURN_IF_TASK_STOPPED(mrb); L_END_DISPATCH: ;}}
 
 #else
 
 #define INIT_DISPATCH JUMP; return mrb_nil_value();
 #define CASE(insn,ops) L_ ## insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
-#define NEXT RETURN_IF_TASK_STOPPED(mrb); CALL_CODE_HOOKS(); goto *optable[insn]
-#define JUMP NEXT
+#define NEXT CALL_CODE_HOOKS(); goto *optable[insn]
+#define JUMP RETURN_IF_TASK_STOPPED(mrb); NEXT
 #define END_DISPATCH RETURN_IF_TASK_STOPPED(mrb)
 
 #endif
@@ -2467,7 +2467,9 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
    a loop and a recursion both pass one of those, so what a program can spend
    time in is covered, while straight-line code carries neither the branch nor
    the bytes.  Putting it in NEXT would grow mrb_vm_exec enough to cost the
-   whole VM in instruction cache, which is what mruby-task's own check does. */
+   whole VM in instruction cache, which is what mruby-task's check used to
+   do; that check now sits in JUMP for the same reason (see
+   RETURN_IF_TASK_STOPPED below for how the two sets of sites differ). */
 #define CHECK_VM_INTERRUPT(mrb) do { \
   if (mrb_unlikely((mrb)->vm_interrupt)) { \
     (mrb)->vm_interrupt = FALSE; \
@@ -2529,7 +2531,8 @@ task_across_c_boundary(mrb_state *mrb)
         task.switching is always pending at raise time).  The same window
         covers break/ensure unwinding, which carries RBreak in mrb->exc
         across NEXT.  Deferral is bounded: the handler's first instruction
-        consumes mrb->exc.
+        consumes mrb->exc, and the switch is taken at the transfer that
+        follows.
 
       - a C-level ObjectSpace walk holds gc.iterating true.  The walk runs
         callbacks (which may call back into mrb_vm_exec via mrb_yield);
@@ -2542,6 +2545,24 @@ task_across_c_boundary(mrb_state *mrb)
 
    Each check re-reads the state it decides on, so a deferred switch is
    honored by the first check that finds the condition gone.
+
+   The check runs at control transfers only: JUMP, not NEXT.  That covers
+   OP_JMP, OP_JMPIF, OP_JMPNOT, OP_JMPNIL and OP_JMPUW on their taken
+   side, the calls OP_SENDB (OP_SEND reaches it through L_SENDB), OP_CALL,
+   OP_BLKCALL, OP_ENTER and OP_EXEC, and OP_RETURN.  A loop and a
+   recursion both pass one of those, and a C method call is checked at
+   the JUMP right after it returns, which is where the C-boundary
+   deferral lifts.  Straight-line code between transfers carries neither
+   the loads nor the branch; what it gives up is promptness for a request
+   that arrives mid-run, and that delay has no bound in principle: a
+   long literal or a class body with no call and no jump runs to its next
+   transfer first.  The set is wider than the five sites CHECK_VM_INTERRUPT
+   uses because a switch wants to be taken as soon as the C boundary that
+   deferred it is gone, while an interrupt, raised as an exception, can
+   wait for the next loop or send.  The attr_reader and attr_writer fast
+   paths in OP_SEND pop into NEXT and so are checked by CHECK_VM_INTERRUPT
+   but not here; they pop the frame they pushed in the same instruction,
+   so the answer is the same on either side of them.
 
    The dispatch path pays only the test in RETURN_IF_TASK_STOPPED:
    `switching || c->status == MRB_TASK_STOPPED`, one volatile load and one
@@ -2559,13 +2580,13 @@ task_across_c_boundary(mrb_state *mrb)
    later raise longjmps into a freed frame (issue #6863).
 
    task_must_yield() stays out of line in the computed-goto build, where
-   NEXT expands at every opcode and mrb_vm_exec carries MRB_FLATTEN: an
-   inline predicate is copied at each of those sites along with
-   task_across_c_boundary().  The switch build expands the check once, so
-   a call there would cost what it saves elsewhere.
+   JUMP expands at every transfer site and mrb_vm_exec carries
+   MRB_FLATTEN: an inline predicate is copied at each of those sites along
+   with task_across_c_boundary().  The switch build expands the check
+   once, so a call there would cost what it saves elsewhere.
 
    RETURN_IF_TASK_STOPPED must only be expanded where prev_jmp is in
-   scope, i.e. inside mrb_vm_exec (via NEXT / END_DISPATCH). */
+   scope, i.e. inside mrb_vm_exec (via JUMP / END_DISPATCH). */
 #if !defined(MRB_USE_VM_SWITCH_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
 #define MRB_TASK_NOINLINE __attribute__((noinline))
 #else
