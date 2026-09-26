@@ -2510,7 +2510,9 @@ task_across_c_boundary(mrb_state *mrb)
       mrb_vm_exec leaves the call-info stack drifted and trips the assertion
       in mrb_vm_run.  This happens when Task.pass is driven from the root
       context (the UI-loop-on-root pattern) while a stray switch flag is
-      left set by background-task activity (issue #6887).
+      left set by background-task activity (issue #6887).  mrb_tick raises
+      no request while no task is running, so the flag is not normally
+      found set here; when it is, it is left alone.
 
    2. Always for a context marked MRB_TASK_STOPPED, ahead of every deferral
       below: the task is going away, so nothing is gained by holding it on

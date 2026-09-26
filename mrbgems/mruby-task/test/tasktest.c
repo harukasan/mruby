@@ -7,6 +7,15 @@
 #include <mruby/error.h>
 #include "task.h"
 
+/* CPU-time deadline `ms` milliseconds from now, for the busy-waits below.
+   Busy-waiting keeps the CPU, so CPU time and wall time agree well enough,
+   and ticks keep firing throughout. */
+static clock_t
+deadline_after_ms(mrb_int ms)
+{
+  return clock() + (clock_t)(((double)ms / 1000.0) * (double)CLOCKS_PER_SEC);
+}
+
 /* Burn CPU until `ms` milliseconds of CPU time have elapsed, then raise.
    Blocking longer than MRB_TICK_UNIT * MRB_TIMESLICE_TICK_COUNT guarantees
    the tick handler has expired the running task's timeslice, so
@@ -18,12 +27,38 @@ tasktest_block_then_raise(mrb_state *mrb, mrb_value self)
 {
   mrb_int ms;
   mrb_get_args(mrb, "i", &ms);
-  clock_t end = clock() + (clock_t)(((double)ms / 1000.0) * (double)CLOCKS_PER_SEC);
+  clock_t end = deadline_after_ms(ms);
   while (clock() < end) {
-    /* busy-wait; ticks keep firing */
+    /* busy-wait, ticks keep firing */
   }
   mrb_raise(mrb, E_RUNTIME_ERROR, "raised after blocking");
   return mrb_nil_value(); /* not reached */
+}
+
+/* The build's timeslice in milliseconds, so tests can derive their waits
+   from it instead of hard-coding a count that a bigger MRB_TICK_UNIT or
+   MRB_TIMESLICE_TICK_COUNT would break. */
+static mrb_value
+tasktest_timeslice_ms(mrb_state *mrb, mrb_value self)
+{
+  return mrb_fixnum_value((mrb_int)MRB_TICK_UNIT * (mrb_int)MRB_TIMESLICE_TICK_COUNT);
+}
+
+/* Busy-wait inside this C frame until the switch flag is raised or `ms`
+   milliseconds pass, and report which. Polling the flag from Ruby cannot
+   see it on the root context: every iteration of the polling loop is a
+   control transfer, and the VM's check runs there before the next load.
+   Watching from a C frame has no transfers in it. */
+static mrb_value
+tasktest_wait_switch_pending(mrb_state *mrb, mrb_value self)
+{
+  mrb_int ms;
+  mrb_get_args(mrb, "i", &ms);
+  clock_t end = deadline_after_ms(ms);
+  while (clock() < end) {
+    if (mrb->task.switching) return mrb_true_value();
+  }
+  return mrb_false_value();
 }
 
 /* Scheduler-hook probes. Two counters so the replace semantics can be
@@ -288,6 +323,8 @@ mrb_mruby_task_gem_test(mrb_state* mrb)
   struct RClass *tasktest = mrb_define_module(mrb, "TaskTest");
   mrb_define_module_function(mrb, tasktest, "block_then_raise", tasktest_block_then_raise, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "stop_then_sleep", tasktest_stop_then_sleep, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, tasktest, "timeslice_ms", tasktest_timeslice_ms, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "wait_switch_pending", tasktest_wait_switch_pending, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_probe_hook", tasktest_install_probe_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "probe_count", tasktest_probe_count, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_wake_hook", tasktest_install_wake_hook, MRB_ARGS_REQ(1));

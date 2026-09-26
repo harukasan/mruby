@@ -541,7 +541,8 @@ mrb_tick(mrb_state *mrb)
 
   /* Decrease timeslice for running task */
   t = q_ready_;
-  if (t && t->status == MRB_TASK_STATUS_RUNNING && t->timeslice > 0) {
+  mrb_bool running = (t != NULL && t->status == MRB_TASK_STATUS_RUNNING);
+  if (running && t->timeslice > 0) {
     t->timeslice--;
     if (t->timeslice == 0) {
       switching_ = TRUE;  /* Trigger context switch */
@@ -586,7 +587,14 @@ mrb_tick(mrb_state *mrb)
           }
           curr->reason = MRB_TASK_REASON_NONE;
           mrb_task_q_insert(mrb, curr);
-          switching_ = TRUE;
+          /* A switch request is for the task that has the CPU. With none
+           * running (the root context is running, or the scheduler is
+           * between tasks) the woken task is picked up from the ready
+           * queue at the next scheduler entry, and a request raised now
+           * would only sit on the root context, where nothing acts on it
+           * and every control transfer reads it. Same gate as
+           * resume_task_internal() and wake_up_join_waiters(). */
+          if (running) switching_ = TRUE;
         }
         else if (next_wakeup == UINT32_MAX ||
                  (int32_t)(curr_wakeup - next_wakeup) < 0) {
