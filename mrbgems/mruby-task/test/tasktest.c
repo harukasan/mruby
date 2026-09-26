@@ -267,11 +267,27 @@ tasktest_proc_set_deep(mrb_state *mrb, mrb_value self)
   return mrb_ary_new_from_values(mrb, 4, r);
 }
 
+/* Stop the given task from C (the caller passes its own), then sleep for
+   0 ms without leaving this C frame. mrb_stop_task() raises no switch
+   request, and the C-frame path of sleep_us_impl() clears any that was
+   pending, so when this returns the VM has no flag to go on: only
+   c->status says the task is gone. See stop_across_c_sleep.rb. */
+static mrb_value
+tasktest_stop_then_sleep(mrb_state *mrb, mrb_value self)
+{
+  mrb_value task;
+  mrb_get_args(mrb, "o", &task);
+  mrb_stop_task(mrb, task);
+  mrb_funcall(mrb, self, "sleep_ms", 1, mrb_fixnum_value(0));
+  return mrb_nil_value();
+}
+
 void
 mrb_mruby_task_gem_test(mrb_state* mrb)
 {
   struct RClass *tasktest = mrb_define_module(mrb, "TaskTest");
   mrb_define_module_function(mrb, tasktest, "block_then_raise", tasktest_block_then_raise, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, tasktest, "stop_then_sleep", tasktest_stop_then_sleep, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_probe_hook", tasktest_install_probe_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "probe_count", tasktest_probe_count, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_wake_hook", tasktest_install_wake_hook, MRB_ARGS_REQ(1));

@@ -2499,51 +2499,91 @@ task_across_c_boundary(mrb_state *mrb)
   return FALSE;
 }
 
-/* Defer task switches while a C-level ObjectSpace walk holds gc.iterating
-   true. The walk runs callbacks (which may call back into mrb_vm_exec via
-   mrb_yield); returning early from an inner exec while the outer C
-   iteration is still active drifts the call-info stack and eventually
-   crashes (issue #6862). Switches resume at the next OP boundary after
-   the walk releases gc.iterating. A pending switch is also deferred while
-   executing across a C call boundary (see task_across_c_boundary). A
-   pending MRB_TASK_STOPPED is not deferred, since the task is going away.
+/* When mrb_vm_exec may hand the CPU back to the scheduler.  This is the one
+   place the rules are written down; task.c refers here.  task_must_yield()
+   applies them in this order:
 
-   A pending switch is likewise deferred while an exception is in flight
-   (mrb->exc set). The L_RAISE handler-found path repoints ci->pc at the
-   catch handler and falls into NEXT; honoring the switch there returns
-   early BEFORE OP_EXCEPT consumes the exception, so the scheduler's
-   execute_task_vm mistakes the already-handled exception for an
-   unhandled one, captures it as the task result and clears mrb->exc —
-   the resumed task then runs the rescue with no exception pending and
-   the begin block silently evaluates to nil. Observed in the field as a
-   C extension's mrb_raise being un-rescuable whenever it fires after a
-   long-blocking call (the timeslice always expires mid-call, so
-   task.switching is always pending at raise time). The same window
-   covers break/ensure unwinding, which carries RBreak in mrb->exc
-   across NEXT. Deferral is bounded: the handler's first instruction
-   consumes mrb->exc, so the switch happens one instruction later.
+   1. Never on the root context.  The root context is not a task: it has no
+      scheduler frame to catch the early return, so bailing out of its
+      mrb_vm_exec leaves the call-info stack drifted and trips the assertion
+      in mrb_vm_run.  This happens when Task.pass is driven from the root
+      context (the UI-loop-on-root pattern) while a stray switch flag is
+      left set by background-task activity (issue #6887).
 
-   mrb->jmp is restored to prev_jmp before returning, exactly as the
-   normal return paths below do. mrb_vm_exec set mrb->jmp to its own
-   stack-local c_jmp on entry; leaving it dangling after this early return
-   means a later raise longjmps into a freed frame (issue #6863).
+   2. Always for a context marked MRB_TASK_STOPPED, ahead of every deferral
+      below: the task is going away, so nothing is gained by holding it on
+      a C boundary or an in-flight exception.
 
-   A pending switch is never honored on the root context. The root context
-   is not a task: it has no scheduler frame to catch the early return, so
-   bailing out of its mrb_vm_exec leaves the call-info stack drifted and trips
-   the assertion in mrb_vm_run. This happens when Task.pass is driven from the
-   root context (the UI-loop-on-root pattern) while a stray switch flag is
-   left set by background-task activity (issue #6887). switching is set from
-   the timer interrupt (mrb_tick), so a genuine task always clears it on the
-   next OP boundary; only the root context can observe it spuriously.
+   3. Otherwise a pending switch is deferred while:
 
-   This macro must only be expanded where prev_jmp is in scope, i.e.
-   inside mrb_vm_exec (via NEXT / END_DISPATCH). */
+      - an exception is in flight (mrb->exc set).  The L_RAISE handler-found
+        path repoints ci->pc at the catch handler and falls into NEXT;
+        honoring the switch there returns early BEFORE OP_EXCEPT consumes
+        the exception, so the scheduler's execute_task_vm mistakes the
+        already-handled exception for an unhandled one, captures it as the
+        task result and clears mrb->exc -- the resumed task then runs the
+        rescue with no exception pending and the begin block silently
+        evaluates to nil.  Observed in the field as a C extension's
+        mrb_raise being un-rescuable whenever it fires after a
+        long-blocking call (the timeslice always expires mid-call, so
+        task.switching is always pending at raise time).  The same window
+        covers break/ensure unwinding, which carries RBreak in mrb->exc
+        across NEXT.  Deferral is bounded: the handler's first instruction
+        consumes mrb->exc.
+
+      - a C-level ObjectSpace walk holds gc.iterating true.  The walk runs
+        callbacks (which may call back into mrb_vm_exec via mrb_yield);
+        returning early from an inner exec while the outer C iteration is
+        still active drifts the call-info stack and eventually crashes
+        (issue #6862).
+
+      - the context is executing across a C call boundary
+        (task_across_c_boundary above).
+
+   Each check re-reads the state it decides on, so a deferred switch is
+   honored by the first check that finds the condition gone.
+
+   The dispatch path pays only the test in RETURN_IF_TASK_STOPPED:
+   `switching || c->status == MRB_TASK_STOPPED`, one volatile load and one
+   status load, with the rest behind a call that is not taken until a
+   switch is pending.  The status is read there, not behind the flag,
+   because a stop does not come with a flag: mrb_stop_task() only marks the
+   context, and sleep_us_impl()'s C-frame path clears a flag that was
+   pending.  A task stopped from C and put to sleep in the same C frame
+   would otherwise return to the VM with nothing to say it is gone and run
+   on (test/stop_across_c_sleep.rb).
+
+   mrb->jmp is restored to prev_jmp before returning, exactly as the normal
+   return paths below do.  mrb_vm_exec set mrb->jmp to its own stack-local
+   c_jmp on entry; leaving it dangling after this early return means a
+   later raise longjmps into a freed frame (issue #6863).
+
+   task_must_yield() stays out of line in the computed-goto build, where
+   NEXT expands at every opcode and mrb_vm_exec carries MRB_FLATTEN: an
+   inline predicate is copied at each of those sites along with
+   task_across_c_boundary().  The switch build expands the check once, so
+   a call there would cost what it saves elsewhere.
+
+   RETURN_IF_TASK_STOPPED must only be expanded where prev_jmp is in
+   scope, i.e. inside mrb_vm_exec (via NEXT / END_DISPATCH). */
+#if !defined(MRB_USE_VM_SWITCH_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
+#define MRB_TASK_NOINLINE __attribute__((noinline))
+#else
+#define MRB_TASK_NOINLINE
+#endif
+
+static mrb_bool MRB_TASK_NOINLINE
+task_must_yield(mrb_state *mrb)
+{
+  if (mrb->c == mrb->root_c) return FALSE;
+  if (mrb->c->status == MRB_TASK_STOPPED) return TRUE;
+  return !mrb->exc && !mrb->gc.iterating && !task_across_c_boundary(mrb);
+}
+
 #define RETURN_IF_TASK_STOPPED(mrb) do { \
-  if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
-       !(mrb)->exc && \
-       !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
-      (mrb)->c->status == MRB_TASK_STOPPED) { \
+  if (mrb_unlikely((mrb)->task.switching || \
+                   (mrb)->c->status == MRB_TASK_STOPPED) && \
+      task_must_yield(mrb)) { \
     (mrb)->jmp = prev_jmp; \
     return mrb_nil_value(); \
   } \
